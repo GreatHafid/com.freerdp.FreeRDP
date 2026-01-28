@@ -1,36 +1,153 @@
-# This is a basic workflow to help you get started with Actions
+name: RDP-Tailscale
 
-name: CI
-
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "master" branch
-  push:
-    branches: [ "master" ]
-  pull_request:
-    branches: [ "master" ]
-
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+    inputs:
+      runs-on:
+        description: "Select Operating System"
+        type: choice
+        default: windows-latest
+        options:
+          - windows-latest # Windows 11 / Server 2022
+          - windows-2019   # Windows 10 / Server 2019
+          - ubuntu-24.04   # Linux
+      
+      rdp_username:
+        description: "User Name"
+        default: "root"
+        required: true
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+      rdp_password:
+        description: "Password"
+        default: "admin_123" # غيرها عند التشغيل
+        required: true
+
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
-    runs-on: ubuntu-latest
+  full-stack-session:
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 216000 # 6 hours
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
-
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
-
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      # ===============================
+      # 1. إعداد بيانات الدخول
+      # ===============================
+      - name: Set Credentials
+        shell: bash
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          echo "USER_NAME=${{ inputs.rdp_username }}" >> $GITHUB_ENV
+          echo "USER_PASS=${{ inputs.rdp_password }}" >> $GITHUB_ENV
+
+      # ===============================
+      # 2. تثبيت Tailscale (Windows/Linux)
+      # ===============================
+      - name: Install Tailscale (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\tailscale.msi"
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$env:TEMP\tailscale.msi`"", "/quiet", "/norestart" -Wait
+
+      - name: Install Tailscale (Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: curl -fsSL https://tailscale.com/install.sh | sh
+
+      # ===============================
+      # 3. الاتصال والحصول على IP (تم الإصلاح)
+      # ===============================
+      - name: Connect to Tailscale
+        id: tailscale_up
+        shell: bash
+        env:
+          TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if [ -z "$TS_KEY" ]; then
+            echo "::error::Please add TAILSCALE_AUTH_KEY to Secrets!"
+            exit 1
+          fi
+
+          HOSTNAME="gh-runner-${{ github.run_id }}"
+          
+          # تم إصلاح الخطأ هنا: إزالة --ssh من أمر Windows
+          if [ "$RUNNER_OS" == "Windows" ]; then
+             "/c/Program Files/Tailscale/tailscale.exe" up --authkey=$TS_KEY --hostname=$HOSTNAME --accept-routes
+             IP=$("/c/Program Files/Tailscale/tailscale.exe" ip -4)
+          else
+             # في Linux الميزة مدعومة، نتركها كما هي
+             sudo tailscale up --authkey=$TS_KEY --hostname=$HOSTNAME --accept-routes --ssh
+             IP=$(tailscale ip -4)
+          fi
+          
+          echo "TS_IP=$IP" >> $GITHUB_OUTPUT
+
+      # ===============================
+      # 4. إعداد RDP/VNC (Windows/Linux)
+      # ===============================
+      - name: Configure RDP (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # 1. Enable RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
+          
+          # 2. Firewall
+          New-NetFirewallRule -DisplayName "Allow RDP" -Direction Inbound -LocalPort 3389 -Protocol TCP -Action Allow -ErrorAction SilentlyContinue
+
+          # 3. User Account
+          $pass = ConvertTo-SecureString $env:USER_PASS -AsPlainText -Force
+          $userExists = Get-LocalUser -Name $env:USER_NAME -ErrorAction SilentlyContinue
+          if ($userExists) { Set-LocalUser -Name $env:USER_NAME -Password $pass } 
+          else { New-LocalUser -Name $env:USER_NAME -Password $pass -AccountNeverExpires }
+          
+          # 4. Groups
+          Add-LocalGroupMember -Group "Administrators" -Member $env:USER_NAME
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:USER_NAME
+
+      - name: Configure VNC (Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          sudo apt update
+          sudo apt install -y ubuntu-desktop-minimal tigervnc-standalone-server gnome-session gdm3
+          
+          sudo useradd -m -s /bin/bash $USER_NAME
+          echo "$USER_NAME:$USER_PASS" | sudo chpasswd
+          sudo usermod -aG sudo $USER_NAME
+
+          mkdir -p /home/$USER_NAME/.vnc
+          echo "$USER_PASS" | vncpasswd -f > /home/$USER_NAME/.vnc/passwd
+          chmod 600 /home/$USER_NAME/.vnc/passwd
+          chown -R $USER_NAME:$USER_NAME /home/$USER_NAME/.vnc
+          
+          echo -e '#!/bin/sh\nunset SESSION_MANAGER\nunset DBUS_SESSION_BUS_ADDRESS\nexec gnome-session &' > /home/$USER_NAME/.vnc/xstartup
+          chmod +x /home/$USER_NAME/.vnc/xstartup
+          
+          sudo -u $USER_NAME vncserver :1 -geometry 1280x720 -depth 24
+
+      # ===============================
+      # 5. عرض المعلومات (ادخل الآن!)
+      # ===============================
+      - name: 📢 CONNECTION INFO (CONNECT NOW)
+        run: |
+          echo "=========================================================="
+          echo "   🚀 REMOTE DESKTOP IS READY!"
+          echo "=========================================================="
+          echo "Tailscale IP : ${{ steps.tailscale_up.outputs.TS_IP }}"
+          echo "Username     : ${{ inputs.rdp_username }}"
+          echo "Password     : ${{ inputs.rdp_password }}"
+          echo "----------------------------------------------------------"
+          echo "⚠️  Software installation is running in the BACKGROUND."
+          echo "⚠️  You can connect immediately. Icons will appear as they install."
+          echo "=========================================================="
+      # ===============================
+      # 6. الحلقة النهائية (Keep Alive)
+      # ===============================
+      - name: Keep Session Alive
+        shell: pwsh
+        run: |
+          Write-Host "Session Active. Press 'Cancel Workflow' to stop."
+          while ($true) {
+            Start-Sleep -Seconds 60
+          }
